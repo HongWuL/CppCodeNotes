@@ -5,16 +5,18 @@
 #include <type_traits>
 #include <iostream>
 #include <memory>
+#include <thread>
 
 class Void { };
 
-
-template <typename T, typename TLS = Void>  //默认TLS为空类(不设置为NULL是为了支持&TLS)
+template <typename T, typename TLS = Void>  //默认TLS为空类(不设置为NULL是为了支持TLS取址操作)
 class DoublyBufferedData {
     class Wrapper;
 public:
     class ScopedPtr {
-    //这个类包含指指针常量，指向存储的数据
+    // 类似于一个代理，通过该类获取缓冲数据和TLS数据
+    // _data指向存储的数据
+    // _w指向Wrapper包含的TLS数据
     friend class DoublyBufferedData;
     public:
         ScopedPtr() : _data(NULL), _w(NULL) {}
@@ -29,20 +31,20 @@ public:
         TLS& tls() { return _w->user_tls(); }   //返回TLS数据
         
     private:
-        const T* _data; //所有线程共享的数据
+        const T* _data; //所有线程共享的数据（即双缓冲数据）
         Wrapper* _w;    //Thread local数据
     };
 
     DoublyBufferedData();
     ~DoublyBufferedData();
     
-    int Read(ScopedPtr* ptr);   //读出DBD中存储的_data指针和当前线程的Wrapper指针
+    int Read(ScopedPtr* ptr);   //读出DBD中存储的_data指针和当前线程的Wrapper指针到ScopedPtr中
     
     //修改后台数据
     template <typename Fn> size_t Modify(Fn& fn);
     template <typename Fn, typename Arg1> size_t Modify(Fn& fn, const Arg1&);
 
-    //修改后台数据，但需要使用前台数据的视野来修改后台)
+    //修改后台数据，但需要使用前台数据的情况来修改后台)
     template <typename Fn> size_t ModifyWithForeground(Fn& fn);
     template <typename Fn, typename Arg1> size_t ModifyWithForeground(Fn& fn, const Arg1&);
 
@@ -92,8 +94,6 @@ private:
     const T* UnsafeRead() const
         { return _data + _index.load(std::memory_order_acquire); }
 
-
-
     // 前台fg数据和后台bg数据
     T _data[2];
 
@@ -111,10 +111,10 @@ private:
     // 所有thread-local的wrapper实例
     std::vector<Wrapper*> _wrappers;
 
-    // Sequence access to _wrappers.
+    // Sequence access to _wrappers.用于添加和删除wrappers元素
     std::mutex _wrappers_mutex;
 
-    // Sequence modifications.
+    // Sequence modifications.用于修改_data
     std::mutex _modify_mutex;
 
 };
@@ -156,7 +156,7 @@ public:
     // _mutex will be locked by the calling pthread and DoublyBufferedData.
     // Most of the time, no modifications are done, so the mutex is
     // uncontended and fast.
-    // TODO，读加锁是为了啥
+    // 在同一个线程中使用，锁基本无竞争
     inline void BeginRead() {
         _mutex.lock();
     }
@@ -194,7 +194,7 @@ DoublyBufferedData<T, TLS>::AddWrapper() {
 }
 
 // Called when thread quits.
-// 移除当前thread的wrappers
+// 移除当前thread的wrapper
 template <typename T, typename TLS>
 void DoublyBufferedData<T, TLS>::RemoveWrapper(
     typename DoublyBufferedData<T, TLS>::Wrapper* w) {
@@ -221,8 +221,11 @@ DoublyBufferedData<T, TLS>::DoublyBufferedData()
     : _index(0)
     , _created_key(false)
     , _wrapper_key(0) {
-    _wrappers.reserve(64);
-    const int rc = pthread_key_create(&_wrapper_key, delete_object<Wrapper>);  //创造_wrapper_key，每个thread看到的_wrapper_key是不一样的，也就是thread_local pthread_key_t;
+
+    _wrappers.reserve(64);  //预留空间优化
+    
+    //创造_wrapper_key，每个thread看到的_wrapper_key是不一样的，也就是thread_local pthread_key_t;
+    const int rc = pthread_key_create(&_wrapper_key, delete_object<Wrapper>);  
     if (rc != 0) {
         std::cout << "Fail to pthread_key_create: " << rc << std::endl;
     } else {
@@ -264,7 +267,8 @@ int DoublyBufferedData<T, TLS>::Read(
     if (!_created_key) {
         return -1;
     }
-    Wrapper* w = static_cast<Wrapper*>(pthread_getspecific(_wrapper_key));    //读线程私有Wrapper*
+    //读线程关联的Wrapper*
+    Wrapper* w = static_cast<Wrapper*>(pthread_getspecific(_wrapper_key));    
     if (w != NULL) {
         // Wrapper已经创建
         w->BeginRead();
@@ -275,6 +279,7 @@ int DoublyBufferedData<T, TLS>::Read(
     //新建一个Wrapper
     w = AddWrapper();
     if (w != NULL) {
+        //将w关联到当前线程
         const int rc = pthread_setspecific(_wrapper_key, w);
         if (rc == 0) {
             w->BeginRead();
